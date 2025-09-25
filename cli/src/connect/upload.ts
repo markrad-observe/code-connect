@@ -4,6 +4,9 @@ import { getApiUrl, getHeaders } from './figma_rest_api'
 import { exitWithFeedbackMessage } from './helpers'
 import { parseFigmaNode } from './validation'
 import { isFetchError, request } from '../common/fetch'
+import { trace, SpanStatusCode, Span } from '@opentelemetry/api'
+import { tracer, logger as otelLogger, uploadedDocsCounter } from '../otel'
+import { SeverityNumber } from '@opentelemetry/api-logs'
 
 interface Args {
   accessToken: string
@@ -17,10 +20,28 @@ function codeConnectStr(doc: CodeConnectJSON) {
 }
 
 export async function upload({ accessToken, docs, batchSize, verbose }: Args) {
-  const apiUrl = getApiUrl(docs?.[0]?.figmaNode ?? '') + '/code_connect'
+  return tracer.startActiveSpan('figma.upload', async (span: Span) => {
+    try {
+      const apiUrl = getApiUrl(docs?.[0]?.figmaNode ?? '') + '/code_connect'
 
-  try {
-    logger.info(`Uploading to Figma...`)
+      span.setAttributes({
+        'figma.upload.docsCount': docs.length,
+        'figma.upload.batchSize': batchSize || 'default',
+        'figma.upload.apiUrl': apiUrl,
+      })
+
+      otelLogger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Starting upload to Figma',
+        attributes: {
+          docsCount: docs.length,
+          batchSize: batchSize || 'default',
+          apiUrl,
+        },
+      })
+
+      logger.info(`Uploading to Figma...`)
 
     if (batchSize) {
       if (typeof batchSize !== 'number') {
@@ -119,24 +140,73 @@ export async function upload({ accessToken, docs, batchSize, verbose }: Args) {
       {} as Record<string, CodeConnectJSON[]>,
     )
 
-    for (const [label, docs] of Object.entries(docsByLabel)) {
-      logger.info(
-        `Successfully uploaded to Figma, for ${label}:\n${docs.map((doc) => `-> ${codeConnectStr(doc)}`).join('\n')}`,
-      )
-    }
-  } catch (err) {
-    if (isFetchError(err)) {
-      if (err.response) {
-        logger.error(
-          `Failed to upload to Figma (${err.response.status}): ${err.response.status} ${err.data?.message}`,
+      for (const [label, docs] of Object.entries(docsByLabel)) {
+        logger.info(
+          `Successfully uploaded to Figma, for ${label}:\n${docs.map((doc) => `-> ${codeConnectStr(doc)}`).join('\n')}`,
         )
-      } else {
-        logger.error(`Failed to upload to Figma: ${err.message}`)
       }
-      logger.debug(JSON.stringify(err?.data))
-    } else {
-      logger.error(`Failed to upload to Figma: ${err}`)
+
+      span.setStatus({ code: SpanStatusCode.OK })
+
+      // Record metrics for uploaded documents
+      uploadedDocsCounter.add(docs.length, {
+        batchSize: batchSize ? batchSize.toString() : 'default',
+      })
+
+      otelLogger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Successfully completed upload to Figma',
+        attributes: {
+          totalDocs: docs.length,
+        },
+      })
+    } catch (err) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message })
+      span.recordException(err as Error)
+
+      if (isFetchError(err)) {
+        if (err.response) {
+          const errorMessage = `Failed to upload to Figma (${err.response.status}): ${err.response.status} ${err.data?.message}`
+          logger.error(errorMessage)
+
+          otelLogger.emit({
+            severityNumber: SeverityNumber.ERROR,
+            severityText: 'ERROR',
+            body: errorMessage,
+            attributes: {
+              status: err.response.status,
+              errorData: JSON.stringify(err.data),
+            },
+          })
+        } else {
+          logger.error(`Failed to upload to Figma: ${err.message}`)
+
+          otelLogger.emit({
+            severityNumber: SeverityNumber.ERROR,
+            severityText: 'ERROR',
+            body: 'Failed to upload to Figma',
+            attributes: {
+              error: err.message,
+            },
+          })
+        }
+        logger.debug(JSON.stringify(err?.data))
+      } else {
+        logger.error(`Failed to upload to Figma: ${err}`)
+
+        otelLogger.emit({
+          severityNumber: SeverityNumber.ERROR,
+          severityText: 'ERROR',
+          body: 'Failed to upload to Figma',
+          attributes: {
+            error: String(err),
+          },
+        })
+      }
+      exitWithFeedbackMessage(1)
+    } finally {
+      span.end()
     }
-    exitWithFeedbackMessage(1)
-  }
+  })
 }
