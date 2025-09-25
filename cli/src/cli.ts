@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+// Initialize OpenTelemetry FIRST before any other imports
+import { initOtel, shutdownOtel } from './otel'
+initOtel()
+
 import * as commander from 'commander'
 import { addConnectCommandToProgram } from './commands/connect'
 import { maybePrefillWizardQuestionsForTesting } from './connect/wizard/helpers'
@@ -31,5 +35,16 @@ async function run() {
     process.exit(1)
   }
 }
+
+// Graceful shutdown handlers
+process.on('SIGTERM', () => {
+  shutdownOtel()
+  process.exit(0)
+})
+
+process.on('SIGINT', () => {
+  shutdownOtel()
+  process.exit(0)
+})
 
 run()

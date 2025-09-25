@@ -1,5 +1,7 @@
 
 import { ProxyAgent, setGlobalDispatcher } from 'undici'
+import { trace, SpanStatusCode, Span } from '@opentelemetry/api'
+import { tracer, httpRequestCounter, httpRequestDuration } from '../otel'
 
 type Method = 'POST' | 'GET' | 'PUT' | 'DELETE' | 'post' | 'get' | 'put' | 'delete'
 
@@ -52,33 +54,101 @@ async function makeRequestInternal<ResponseT = unknown>(
   options: Options = {},
   body?: Record<any, any>,
 ) {
-  const urlObj = new URL(url)
-  if (options?.query) {
-    Object.entries(options.query).forEach(([key, value]) => {
-      urlObj.searchParams.append(key, value as string)
-    })
-  }
-  url = urlObj.toString()
+  return tracer.startActiveSpan('http.request', async (span: Span) => {
+    const startTime = Date.now()
 
-  if (body) {
-    options.body = JSON.stringify(body)
-  }
-
-  const response = await fetch(url, { ...options, method })
-  if (!response.ok) {
-    let data
     try {
-      data = await response.json()
-    } catch (e) {
-      data = undefined
+      const urlObj = new URL(url)
+      if (options?.query) {
+        Object.entries(options.query).forEach(([key, value]) => {
+          urlObj.searchParams.append(key, value as string)
+        })
+      }
+      url = urlObj.toString()
+
+      span.setAttributes({
+        'http.method': method,
+        'http.url': url,
+        'http.scheme': urlObj.protocol.slice(0, -1),
+        'http.host': urlObj.host,
+        'http.target': urlObj.pathname + urlObj.search,
+      })
+
+      if (body) {
+        options.body = JSON.stringify(body)
+        span.setAttributes({
+          'http.request.body.size': options.body.length,
+        })
+      }
+
+      const response = await fetch(url, { ...options, method })
+
+      span.setAttributes({
+        'http.status_code': response.status,
+        'http.status_text': response.statusText,
+      })
+
+      if (!response.ok) {
+        let data
+        try {
+          data = await response.json()
+        } catch (e) {
+          data = undefined
+        }
+
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: `HTTP ${response.status}: ${response.statusText}`
+        })
+
+        throw new FetchError(response, data)
+      }
+
+      const text = await response.text()
+      const data = text ? (JSON.parse(text) as ResponseT) : ({} as ResponseT)
+
+      span.setAttributes({
+        'http.response.body.size': text.length,
+      })
+
+      span.setStatus({ code: SpanStatusCode.OK })
+
+      const duration = (Date.now() - startTime) / 1000
+      httpRequestCounter.add(1, {
+        method,
+        status: response.status.toString(),
+        host: urlObj.host,
+      })
+      httpRequestDuration.record(duration, {
+        method,
+        status: response.status.toString(),
+        host: urlObj.host,
+      })
+
+      return { response, data }
+    } catch (error) {
+      const duration = (Date.now() - startTime) / 1000
+      const status = error instanceof FetchError ? error.response.status.toString() : 'error'
+      const urlObj = new URL(url)
+
+      httpRequestCounter.add(1, {
+        method,
+        status,
+        host: urlObj.host,
+      })
+      httpRequestDuration.record(duration, {
+        method,
+        status,
+        host: urlObj.host,
+      })
+
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message })
+      span.recordException(error as Error)
+      throw error
+    } finally {
+      span.end()
     }
-    throw new FetchError(response, data)
-  }
-
-  const text = await response.text()
-  const data = text ? (JSON.parse(text) as ResponseT) : ({} as ResponseT)
-
-  return { response, data }
+  })
 }
 
 export const request = {

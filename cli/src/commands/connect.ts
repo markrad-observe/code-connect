@@ -34,6 +34,9 @@ import {
   ResolveImportsFn,
 } from '../connect/parser_common'
 import { findAndResolveImports, parseReactDoc } from '../react/parser'
+import { trace, SpanStatusCode, Span } from '@opentelemetry/api'
+import { tracer, logger as otelLogger, commandCounter, commandDuration } from '../otel'
+import { SeverityNumber } from '@opentelemetry/api-logs'
 
 export type BaseCommand = commander.Command & {
   token: string
@@ -410,57 +413,121 @@ async function handlePublish(
     batchSize: string
   },
 ) {
-  setupHandler(cmd)
+  return tracer.startActiveSpan('command.publish', async (span: Span) => {
+    const startTime = Date.now()
 
-  let dir = getDir(cmd)
-  const projectInfo = await getProjectInfo(dir, cmd.config)
+    try {
+      commandCounter.add(1, { command: 'publish' })
+      setupHandler(cmd)
 
-  const codeConnectObjects = await getCodeConnectObjects(cmd, projectInfo)
+      let dir = getDir(cmd)
+      span.setAttributes({
+        'command.name': 'publish',
+        'command.dir': dir,
+        'command.skipValidation': cmd.skipValidation,
+        'command.dryRun': cmd.dryRun,
+      })
 
-  if (codeConnectObjects.length === 0) {
-    logger.warn(
-      `No Code Connect files found in ${dir} - Make sure you have configured \`include\` and \`exclude\` in your figma.config.json file correctly, or that you are running in a directory that contains Code Connect files.`,
-    )
-    process.exit(0)
-  }
+      otelLogger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Starting publish command',
+        attributes: { dir, skipValidation: cmd.skipValidation },
+      })
 
-  if (cmd.dryRun) {
-    logger.info(`Files that would be published:`)
-    logger.info(codeConnectObjects.map((o) => `- ${o.component} (${o.figmaNode})`).join('\n'))
-  }
+      const projectInfo = await getProjectInfo(dir, cmd.config)
+      const codeConnectObjects = await getCodeConnectObjects(cmd, projectInfo)
 
-  const accessToken = getAccessTokenOrExit(cmd)
+      span.setAttributes({
+        'command.codeConnectObjects.count': codeConnectObjects.length,
+      })
 
-  if (cmd.skipValidation) {
-    logger.info('Validation skipped')
-  } else {
-    logger.info('Validating Code Connect files...')
-    var start = new Date().getTime()
-    const valid = await validateDocs(cmd, accessToken, codeConnectObjects)
-    if (!valid) {
-      exitWithFeedbackMessage(1)
-    } else {
-      var end = new Date().getTime()
-      var time = end - start
-      logger.info(`All Code Connect files are valid (${time}ms)`)
+      if (codeConnectObjects.length === 0) {
+        logger.warn(
+          `No Code Connect files found in ${dir} - Make sure you have configured \`include\` and \`exclude\` in your figma.config.json file correctly, or that you are running in a directory that contains Code Connect files.`,
+        )
+        span.setStatus({ code: SpanStatusCode.OK })
+        process.exit(0)
+      }
+
+      if (cmd.dryRun) {
+        logger.info(`Files that would be published:`)
+        logger.info(codeConnectObjects.map((o) => `- ${o.component} (${o.figmaNode})`).join('\n'))
+      }
+
+      const accessToken = getAccessTokenOrExit(cmd)
+
+      if (cmd.skipValidation) {
+        logger.info('Validation skipped')
+      } else {
+        logger.info('Validating Code Connect files...')
+        var start = new Date().getTime()
+        const valid = await validateDocs(cmd, accessToken, codeConnectObjects)
+        if (!valid) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'Validation failed' })
+          exitWithFeedbackMessage(1)
+        } else {
+          var end = new Date().getTime()
+          var time = end - start
+          logger.info(`All Code Connect files are valid (${time}ms)`)
+          span.setAttributes({ 'command.validation.duration': time })
+        }
+      }
+
+      if (cmd.dryRun) {
+        logger.info(`Dry run complete`)
+        span.setStatus({ code: SpanStatusCode.OK })
+        process.exit(0)
+      }
+
+      let batchSize
+      if (cmd.batchSize) {
+        batchSize = parseInt(cmd.batchSize, 10)
+        if (isNaN(batchSize)) {
+          logger.error('Error: failed to parse batch-size. batch-size passed must be a number')
+          span.setStatus({ code: SpanStatusCode.ERROR, message: 'Invalid batch size' })
+          exitWithFeedbackMessage(1)
+        }
+        span.setAttributes({ 'command.batchSize': batchSize })
+      }
+
+      upload({ accessToken, docs: codeConnectObjects, batchSize: batchSize, verbose: cmd.verbose })
+
+      span.setStatus({ code: SpanStatusCode.OK })
+
+      const duration = (Date.now() - startTime) / 1000
+      commandDuration.record(duration, { command: 'publish', status: 'success' })
+
+      otelLogger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Publish command completed successfully',
+        attributes: {
+          codeConnectObjectsCount: codeConnectObjects.length,
+          batchSize: batchSize || 'default',
+          duration,
+        },
+      })
+    } catch (error) {
+      const duration = (Date.now() - startTime) / 1000
+      commandDuration.record(duration, { command: 'publish', status: 'error' })
+
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message })
+      span.recordException(error as Error)
+      otelLogger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Publish command failed',
+        attributes: {
+          error: (error as Error).message,
+          duration,
+        },
+      })
+      throw error
+    } finally {
+      span.end()
     }
-  }
-
-  if (cmd.dryRun) {
-    logger.info(`Dry run complete`)
-    process.exit(0)
-  }
-
-  let batchSize
-  if (cmd.batchSize) {
-    batchSize = parseInt(cmd.batchSize, 10)
-    if (isNaN(batchSize)) {
-      logger.error('Error: failed to parse batch-size. batch-size passed must be a number')
-      exitWithFeedbackMessage(1)
-    }
-  }
-
-  upload({ accessToken, docs: codeConnectObjects, batchSize: batchSize, verbose: cmd.verbose })
+  })
 }
 
 async function handleUnpublish(cmd: BaseCommand & { node: string; label: string }) {
